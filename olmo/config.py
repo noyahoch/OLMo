@@ -503,6 +503,12 @@ class ModelConfig(BaseConfig):
     Weight for MoE router z-loss where None means no router z-loss. 0.001 is a common value.
     """
 
+    moe_router_ema_normalize: bool = False
+    """
+    If True, normalize router logits by a per-expert EMA of mean/std before top-k selection,
+    replacing the need for a load-balancing auxiliary loss (set moe_loss_weight=0 when enabled).
+    """
+
     moe_dropless: Optional[bool] = True
     """
     Whether to use [dMoE](https://arxiv.org/abs/2211.15841).

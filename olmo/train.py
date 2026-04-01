@@ -978,6 +978,15 @@ class Trainer:
         if moe_z_batch_loss is not None:
             metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
 
+        # Log per-expert gate logit EMA statistics per layer (only when EMA normalization is enabled)
+        if self.model.config.block_type == BlockType.moe and self.model.config.moe_router_ema_normalize:
+            for layer_idx, block in enumerate(self.model.transformer.blocks):
+                ema_mean = block.gate_logit_ema_mean  # [num_experts]
+                ema_std  = block.gate_logit_ema_std   # [num_experts]
+                for expert_idx in range(ema_mean.shape[0]):
+                    metrics[f"train/GateLogit/EMA_mean/layer{layer_idx}/expert{expert_idx}"] = ema_mean[expert_idx].item()
+                    metrics[f"train/GateLogit/EMA_std/layer{layer_idx}/expert{expert_idx}"] = ema_std[expert_idx].item()
+
         # Maybe collect post-step optimizer-specific metrics.
         if should_log_optim_metrics_this_step:
             optim_metrics = self.optim.get_post_step_metrics(

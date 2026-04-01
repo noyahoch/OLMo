@@ -13,6 +13,7 @@ from abc import abstractmethod
 from collections import defaultdict
 from functools import partial
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -692,6 +693,14 @@ class OLMoEBlock(OLMoBlock):
         self.moe_args = config_to_moe_args(config)
         self.ffn = dMoE(self.moe_args) if self.config.moe_dropless else MoE(self.moe_args)
 
+        # EMA buffers and hook for per-expert logit normalization (optional, see moe_router_ema_normalize).
+        if config.moe_router_ema_normalize:
+            num_experts = config.moe_num_experts
+            self.register_buffer("gate_logit_ema_mean", torch.zeros(num_experts))
+            self.register_buffer("gate_logit_ema_std",  torch.ones(num_experts))
+            self._gate_ema_alpha = 0.99
+            self.ffn.router.register_forward_hook(self._router_ema_hook)
+
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)
 
@@ -738,6 +747,61 @@ class OLMoEBlock(OLMoBlock):
         if self.ffn.experts.bias is not None:
             torch.nn.init.zeros_(self.ffn.experts.bias)
         init_normal(self.ffn.router.layer, std=in_std, init_cutoff_factor=cutoff_factor)
+
+    def _router_ema_hook(
+        self,
+        module: torch.nn.Module,
+        input: Any,
+        output: Any,
+    ) -> Any:
+        """Forward hook on ffn.router.
+
+        Per-expert normalization + selective EMA update:
+          1. Normalize each token's logit for expert e using the *previous* (stale) EMA
+             mean/std for that expert.  Normalization is applied to `logits` (keeping
+             the gradient graph intact so the router can still learn).
+          2. Recompute routing from the normalized logits.
+          3. For each expert e, update its EMA using only the *raw* logits of the tokens
+             that were routed to it (step 2 routing).  Experts that receive no tokens
+             this step are not updated.
+
+        EMA buffers are initialized to mean=0, std=1, so normalization is meaningful
+        from the very first forward pass.
+
+        logits shape:      [tokens, num_experts]
+        norm_indices shape: [tokens, top_k]
+        """
+        _, logits, _, _ = output
+        # Detached float32 copy used only for statistics — never returned or backpropd.
+        raw_logits = logits.detach().float()  # [tokens, num_experts]
+
+        # 1. Normalize using stale EMA, keeping the gradient graph through `logits`.
+        #    EMA buffers are plain tensors (no grad), so they act as detached constants.
+        norm_logits = (logits.float() - self.gate_logit_ema_mean.detach()) / (self.gate_logit_ema_std.detach() + 1e-6)
+        norm_logits = norm_logits.to(logits.dtype)
+
+        # 2. Recompute routing from normalized logits (EMA z-scores; used in place of softmax scores).
+        norm_weights, norm_indices = module._top_k(norm_logits)  # [tokens, top_k]
+
+        if module.args.moe_normalize_expert_weights:
+            norm_weights = norm_weights / torch.norm(
+                norm_weights, p=module.args.moe_normalize_expert_weights, dim=-1, keepdim=True
+            )
+
+        # 3. Selectively update EMA: only tokens routed to expert e contribute to its stats.
+        #    Skip during eval so inference / validation passes don't mutate model state.
+        if self.training:
+            alpha = self._gate_ema_alpha
+            for e in range(raw_logits.shape[1]):
+                mask = (norm_indices == e).any(dim=-1)  # [tokens] bool
+                if not mask.any():
+                    continue
+                selected = raw_logits[mask, e]  # raw logit scores for expert e's assigned tokens
+                self.gate_logit_ema_mean[e].mul_(alpha).add_((1.0 - alpha) * selected.mean())
+                if selected.numel() > 1:
+                    self.gate_logit_ema_std[e].mul_(alpha).add_((1.0 - alpha) * selected.std())
+
+        return norm_logits, norm_logits, norm_weights, norm_indices
 
     def forward(
         self,
