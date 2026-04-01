@@ -696,8 +696,9 @@ class OLMoEBlock(OLMoBlock):
         # EMA buffers and hook for per-expert logit normalization (optional, see moe_router_ema_normalize).
         if config.moe_router_ema_normalize:
             num_experts = config.moe_num_experts
-            self.register_buffer("gate_logit_ema_mean", torch.zeros(num_experts))
-            self.register_buffer("gate_logit_ema_std",  torch.ones(num_experts))
+            ema_dtype = torch.bfloat16 if config.precision == "amp_bf16" else torch.float16 if config.precision == "amp_fp16" else torch.float32
+            self.register_buffer("gate_logit_ema_mean", torch.zeros(num_experts, dtype=ema_dtype))
+            self.register_buffer("gate_logit_ema_std",  torch.ones(num_experts,  dtype=ema_dtype))
             self._gate_ema_alpha = 0.99
             self.ffn.router.register_forward_hook(self._router_ema_hook)
 
@@ -772,13 +773,10 @@ class OLMoEBlock(OLMoBlock):
         norm_indices shape: [tokens, top_k]
         """
         _, logits, _, _ = output
-        # Detached float32 copy used only for statistics — never returned or backpropd.
-        raw_logits = logits.detach().float()  # [tokens, num_experts]
+        raw_logits = logits.detach()  # [tokens, num_experts] — used only for EMA stats, never backpropd
 
         # 1. Normalize using stale EMA, keeping the gradient graph through `logits`.
-        #    EMA buffers are plain tensors (no grad), so they act as detached constants.
-        norm_logits = (logits.float() - self.gate_logit_ema_mean.detach()) / (self.gate_logit_ema_std.detach() + 1e-6)
-        norm_logits = norm_logits.to(logits.dtype)
+        norm_logits = (logits - self.gate_logit_ema_mean) / (self.gate_logit_ema_std + 1e-6)
 
         # 2. Recompute routing from normalized logits (EMA z-scores; used in place of softmax scores).
         norm_weights, norm_indices = module._top_k(norm_logits)  # [tokens, top_k]
