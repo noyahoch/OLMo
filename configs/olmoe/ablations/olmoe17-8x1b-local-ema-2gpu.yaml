@@ -1,4 +1,4 @@
-run_name: olmoe17-8x1b-local-ema
+run_name: olmoe17-8x1b-local-ema-2gpu
 seed: 6198
 dry_run: false
 no_pre_train_checkpoint: true
@@ -80,8 +80,8 @@ sharded_checkpointer: olmo_core
 load_path: null
 
 max_duration: 2ep
-global_train_batch_size: 16
-device_train_microbatch_size: 2
+global_train_batch_size: 32    # 2x (was 16) — 2 GPUs × same per-GPU batch
+device_train_microbatch_size: 4
 
 precision: amp_bf16
 activation_checkpointing: fine_grained
