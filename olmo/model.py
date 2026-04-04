@@ -702,9 +702,9 @@ class OLMoEBlock(OLMoBlock):
             # Plain fp32 attributes (not buffers) — lazily initialized on correct device in the hook.
             # Not registered as buffers because the olmo_core checkpointer doesn't save buffers anyway,
             # and keeping them as plain attributes avoids FSDP bf16 buffer_dtype casting issues.
-            self._ema_mean: Optional[torch.Tensor] = None
-            self._ema_std: Optional[torch.Tensor] = None
-            self._ema_update_norm: float = 0.0  # L1 norm of EMA update this step, for debugging
+            self._ema_mean: Optional[torch.Tensor] = None  # E[X]
+            self._ema_sq: Optional[torch.Tensor] = None    # E[X²]  (std = sqrt(E[X²] - E[X]²))
+            self._ema_update_norm: float = 0.0
             self.ffn.router.register_forward_hook(self._router_ema_hook)
 
         self.attn_norm = LayerNorm.build(config)
@@ -755,7 +755,7 @@ class OLMoEBlock(OLMoBlock):
         init_normal(self.ffn.router.layer, std=in_std, init_cutoff_factor=cutoff_factor)
         if self.config.moe_router_ema_normalize:
             self._ema_mean = None
-            self._ema_std = None
+            self._ema_sq = None
             self._expert_assignments = None
 
     def _router_ema_hook(
@@ -766,9 +766,9 @@ class OLMoEBlock(OLMoBlock):
     ) -> Any:
         """Forward hook on ffn.router.
 
-          1. Normalize each expert's logit using stale EMA mean/std (z-score).
+          1. Z-score normalize each expert's logit using stale EMA mean/std.
              Gradient graph through `logits` is preserved so the router can learn.
-          2. Recompute routing from softmax of z-scores.
+          2. Softmax of z-scores → routing probabilities. Top-k selects experts.
           3. Update EMA over all tokens for each expert (skip during eval).
         """
         self._router_z_loss = None
@@ -777,16 +777,17 @@ class OLMoEBlock(OLMoBlock):
         raw_logits = logits.detach()  # [tokens, num_experts]
         num_experts = raw_logits.shape[1]
 
-        # Lazy-init EMA on correct device (mean=0, std=1 → identity normalization on first step).
+        # Lazy-init EMA on correct device (mean=0, E[X²]=1 → std=1 on first step).
         if self._ema_mean is None or self._ema_mean.device != raw_logits.device:
             self._ema_mean = torch.zeros(num_experts, dtype=torch.float32, device=raw_logits.device)
-            self._ema_std = torch.ones(num_experts, dtype=torch.float32, device=raw_logits.device)
+            self._ema_sq = torch.ones(num_experts, dtype=torch.float32, device=raw_logits.device)
 
-        # 1. Z-score normalize using stale EMA (fp32 for precision, cast back below).
-        norm_logits = (logits - self._ema_mean) / (self._ema_std + 1e-6)
+        # 1. Derive std from EMA statistics: std = sqrt(E[X²] - E[X]²).
+        ema_std = (self._ema_sq - self._ema_mean.pow(2)).clamp(min=1e-8).sqrt()
 
-        # 2. Route from softmax of z-scores (megablocks expects probabilities).
-        norm_scores = norm_logits.softmax(dim=-1)
+        # 2. Z-score normalize, then softmax to get routing probabilities.
+        z = (logits - self._ema_mean) / ema_std
+        norm_scores = z.softmax(dim=-1)
         norm_weights, norm_indices = module._top_k(norm_scores)
 
         if module.args.moe_normalize_expert_weights:
@@ -798,28 +799,24 @@ class OLMoEBlock(OLMoBlock):
         if self.training and self._gate_ema_zloss_weight:
             self._router_z_loss = self._gate_ema_zloss_weight * logits.logsumexp(dim=-1).pow(2).mean()
 
-        # 3. Update EMA over all tokens per expert. Skip during eval.
+        # 3. Update EMA of mean and squared mean over all tokens per expert. Skip during eval.
         if self.training:
             alpha = self._gate_ema_alpha
+            logits_fp32 = raw_logits.float()
             old_mean = self._ema_mean.clone()
-            for e in range(num_experts):
-                selected = raw_logits[:, e].float()
-                self._ema_mean[e].mul_(alpha).add_((1.0 - alpha) * selected.mean())
-                if selected.numel() > 1:
-                    self._ema_std[e].mul_(alpha).add_((1.0 - alpha) * selected.std())
+            self._ema_mean.mul_(alpha).add_((1 - alpha) * logits_fp32.mean(dim=0))
+            self._ema_sq.mul_(alpha).add_((1 - alpha) * logits_fp32.pow(2).mean(dim=0))
             self._ema_update_norm = (self._ema_mean - old_mean).abs().sum().item()
 
             # Count tokens routed to each expert for load-balance logging.
-            counts = norm_indices.new_zeros(num_experts)
-            for e in range(num_experts):
-                counts[e] = (norm_indices == e).sum()
+            counts = torch.bincount(norm_indices.reshape(-1), minlength=num_experts).float()
             if self._expert_assignments is None:
-                self._expert_assignments = counts.float()
+                self._expert_assignments = counts
             else:
-                self._expert_assignments += counts.float()
+                self._expert_assignments += counts
 
         # Cast back to original dtype so megablocks sparse kernels see the expected precision.
-        return norm_scores.to(orig_dtype), norm_logits.to(orig_dtype), norm_weights.to(orig_dtype), norm_indices
+        return norm_scores.to(orig_dtype), logits, norm_weights.to(orig_dtype), norm_indices
 
     def forward(
         self,

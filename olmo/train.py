@@ -1021,9 +1021,10 @@ class Trainer:
                 if inner._ema_mean is None:
                     continue
                 metrics[f"train/GateLogit/EMA_update_norm/layer{layer_idx}"] = inner._ema_update_norm
+                ema_std = (inner._ema_sq - inner._ema_mean.pow(2)).clamp(min=1e-8).sqrt()
                 for expert_idx in range(inner._ema_mean.shape[0]):
                     metrics[f"train/GateLogit/EMA_mean/layer{layer_idx}/expert{expert_idx}"] = inner._ema_mean[expert_idx].item()
-                    metrics[f"train/GateLogit/EMA_std/layer{layer_idx}/expert{expert_idx}"] = inner._ema_std[expert_idx].item()
+                    metrics[f"train/GateLogit/EMA_std/layer{layer_idx}/expert{expert_idx}"] = ema_std[expert_idx].item()
 
         # Maybe collect post-step optimizer-specific metrics.
         if should_log_optim_metrics_this_step:
