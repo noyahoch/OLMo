@@ -812,7 +812,12 @@ class Trainer:
         ce_batch_loss = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
         lb_batch_loss = (
-            None if self.model.config.block_type != BlockType.moe else torch.tensor(0.0, device=self.device)
+            None
+            if (
+                self.model.config.block_type != BlockType.moe
+                or not self.model.config.moe_loss_weight
+            )
+            else torch.tensor(0.0, device=self.device)
         )
         moe_z_batch_loss = (
             None if not self.model.config.moe_zloss_weight else torch.tensor(0.0, device=self.device)
@@ -856,25 +861,55 @@ class Trainer:
                         z_batch_loss += z_loss.detach()
 
                 if self.model.config.block_type == BlockType.moe:
-                    if self.model.config.moe_zloss_weight:
+                    # Megablocks path: aux loss and/or z-loss via save_load_balancing_loss.
+                    # Skipped when moe_router_ema_normalize=True because moe_loss_weight=0
+                    # means save_load_balancing_loss is never called (no data to collect).
+                    if self.model.config.moe_zloss_weight and not self.model.config.moe_router_ema_normalize:
                         lb_loss, moe_z_loss = batched_load_balancing_loss(self.moe_args)
                         lb_loss = lb_loss / len(micro_batches)
                         moe_z_loss = moe_z_loss / len(micro_batches)
                     elif self.model.config.moe_loss_weight:
                         lb_loss = batched_load_balancing_loss(self.moe_args) / len(micro_batches)
-                    if self.model.config.moe_log_expert_assignment:
+                    if self.model.config.moe_log_expert_assignment and not self.model.config.moe_router_ema_normalize:
                         if self.model.config.moe_zloss_weight:
                             tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
                         else:
                             tokens_per_expert, _ = zip(*get_load_balancing_loss())
                         expert_assignments += torch.stack(tokens_per_expert, dim=0)
                     clear_load_balancing_loss()
+                    if self.model.config.moe_log_expert_assignment and self.model.config.moe_router_ema_normalize:
+                        for layer_idx, block in enumerate(self.model.transformer.blocks):
+                            # Unwrap FSDP: writing block.attr = None would shadow the original
+                            # OLMoEBlock's attribute on the FSDP wrapper's __dict__, causing all
+                            # subsequent micro-batch reads to return None via __dict__ lookup
+                            # instead of delegating to block.module via __getattr__.
+                            inner_block = block.module if isinstance(block, FSDP) else block
+                            if inner_block._expert_assignments is not None:
+                                expert_assignments[layer_idx] += inner_block._expert_assignments
+                                inner_block._expert_assignments = None
                     if self.model.config.moe_loss_weight:
                         loss += lb_loss
                         lb_batch_loss += lb_loss.detach()
-                    if self.model.config.moe_zloss_weight:
+                    if self.model.config.moe_zloss_weight and not self.model.config.moe_router_ema_normalize:
                         loss += moe_z_loss
                         moe_z_batch_loss += moe_z_loss.detach()
+                    # EMA path: z-loss computed directly in the router hook, bypassing the
+                    # megablocks coupling between aux loss and z-loss.
+                    if self.model.config.moe_router_ema_normalize and self.model.config.moe_zloss_weight:
+                        ema_z_losses = []
+                        for block in self.model.transformer.blocks:
+                            # Same FSDP unwrapping needed — see note above for _expert_assignments.
+                            inner_block = block.module if isinstance(block, FSDP) else block
+                            if inner_block._router_z_loss is not None:
+                                ema_z_losses.append(inner_block._router_z_loss)
+                            inner_block._router_z_loss = None  # reset for next micro-batch
+                        if ema_z_losses:
+                            # .mean() across layers matches megablocks normalization by num_layers;
+                            # remaining 1/top_k factor difference can be absorbed into moe_zloss_weight.
+                            ema_z_loss = torch.stack(ema_z_losses).mean() / len(micro_batches)
+                            loss += ema_z_loss
+                            assert moe_z_batch_loss is not None
+                            moe_z_batch_loss += ema_z_loss.detach()
 
                 # Run backward pass.
                 loss.backward()
@@ -964,28 +999,31 @@ class Trainer:
             metrics["train/ZLoss"] = z_batch_loss.item()
         if lb_batch_loss is not None:
             metrics["train/LoadBalancingLoss"] = lb_batch_loss.item()
-            # Log assignment metrics.
-            if expert_assignments is not None:
-                for layer_idx, expert_assignments_layer in enumerate(expert_assignments):
-                    total_tokens = expert_assignments_layer.sum().item()
-                    for expert_idx, expert_assignment in enumerate(expert_assignments_layer):
-                        metrics[f"train/TokensPercentage/layer{layer_idx}/expert{expert_idx}"] = (
-                            expert_assignment.item() / total_tokens
-                        ) * 100
-                        metrics[
-                            f"train/TokensTotal/layer{layer_idx}/expert{expert_idx}"
-                        ] = expert_assignment.item()
+        if expert_assignments is not None:
+            for layer_idx, expert_assignments_layer in enumerate(expert_assignments):
+                total_tokens = expert_assignments_layer.sum().item()
+                if total_tokens == 0:
+                    continue
+                for expert_idx, expert_assignment in enumerate(expert_assignments_layer):
+                    metrics[f"train/TokensPercentage/layer{layer_idx}/expert{expert_idx}"] = (
+                        expert_assignment.item() / total_tokens
+                    ) * 100
+                    metrics[
+                        f"train/TokensTotal/layer{layer_idx}/expert{expert_idx}"
+                    ] = expert_assignment.item()
         if moe_z_batch_loss is not None:
             metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
 
         # Log per-expert gate logit EMA statistics per layer (only when EMA normalization is enabled)
         if self.model.config.block_type == BlockType.moe and self.model.config.moe_router_ema_normalize:
             for layer_idx, block in enumerate(self.model.transformer.blocks):
-                ema_mean = block.gate_logit_ema_mean  # [num_experts]
-                ema_std  = block.gate_logit_ema_std   # [num_experts]
-                for expert_idx in range(ema_mean.shape[0]):
-                    metrics[f"train/GateLogit/EMA_mean/layer{layer_idx}/expert{expert_idx}"] = ema_mean[expert_idx].item()
-                    metrics[f"train/GateLogit/EMA_std/layer{layer_idx}/expert{expert_idx}"] = ema_std[expert_idx].item()
+                inner = block.module if isinstance(block, FSDP) else block
+                if inner._ema_mean is None:
+                    continue
+                metrics[f"train/GateLogit/EMA_update_norm/layer{layer_idx}"] = inner._ema_update_norm
+                for expert_idx in range(inner._ema_mean.shape[0]):
+                    metrics[f"train/GateLogit/EMA_mean/layer{layer_idx}/expert{expert_idx}"] = inner._ema_mean[expert_idx].item()
+                    metrics[f"train/GateLogit/EMA_std/layer{layer_idx}/expert{expert_idx}"] = inner._ema_std[expert_idx].item()
 
         # Maybe collect post-step optimizer-specific metrics.
         if should_log_optim_metrics_this_step:
