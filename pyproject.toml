@@ -10,7 +10,7 @@ description = "Open Language Model (OLMo)"
 authors = [
     { name = "Allen Institute for Artificial Intelligence", email = "olmo@allenai.org" }
 ]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 license = { file = "LICENSE" }
 dependencies = [
     "numpy<2",
@@ -41,6 +41,7 @@ dev = [
     "build",
 ]
 train = [
+    "megablocks @ git+https://github.com/Muennighoff/megablocks.git@olmoe",
     "wandb",
     "beaker-gantry",
     "click",

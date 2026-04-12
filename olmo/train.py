@@ -1011,6 +1011,7 @@ class Trainer:
                     metrics[
                         f"train/TokensTotal/layer{layer_idx}/expert{expert_idx}"
                     ] = expert_assignment.item()
+            metrics.update(self._routing_metrics(expert_assignments, "train"))
         if moe_z_batch_loss is not None:
             metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
 
@@ -1084,6 +1085,34 @@ class Trainer:
             peak_gpu_mb = peak_gpu_memory()
             if peak_gpu_mb is not None:
                 metrics["System/Peak GPU Memory (MB)"] = peak_gpu_mb
+        return metrics
+
+    def _routing_metrics(self, expert_assignments: torch.Tensor, prefix: str) -> Dict[str, float]:
+        """Compute per-layer and mean MaxVio + entropy from expert token counts.
+
+        expert_assignments: [n_layers, num_experts] accumulated token counts.
+        MaxVio = (max_load - fair_share) / fair_share  (0 = perfect balance).
+        Entropy normalized to [0, 1] by log(num_experts).
+        """
+        metrics: Dict[str, float] = {}
+        maxvio_layers, entropy_norm_layers = [], []
+        for layer_idx, layer_counts in enumerate(expert_assignments):
+            total_tokens = layer_counts.sum().item()
+            if total_tokens == 0:
+                continue
+            counts = layer_counts.float()
+            num_experts = counts.shape[0]
+            fair_share = total_tokens / num_experts
+            maxvio = ((counts.max() - fair_share) / fair_share).item()
+            p = counts / total_tokens
+            entropy_norm = -(p * torch.log(p + 1e-10)).sum().item() / math.log(num_experts)
+            metrics[f"{prefix}/routing/maxvio/layer{layer_idx}"] = maxvio
+            metrics[f"{prefix}/routing/entropy_normalized/layer{layer_idx}"] = entropy_norm
+            maxvio_layers.append(maxvio)
+            entropy_norm_layers.append(entropy_norm)
+        if maxvio_layers:
+            metrics[f"{prefix}/routing/maxvio"] = sum(maxvio_layers) / len(maxvio_layers)
+            metrics[f"{prefix}/routing/entropy_normalized"] = sum(entropy_norm_layers) / len(entropy_norm_layers)
         return metrics
 
     def log_metrics_to_console(self, prefix: str, metrics: Dict[str, float]):
@@ -1172,6 +1201,23 @@ class Trainer:
             self.log_metrics_to_console(f"{evaluator.label}", metrics)
 
             del eval_batches
+
+        # Collect routing metrics from eval pass, mirroring train_batch.
+        if self.model.config.block_type == BlockType.moe and self.model.config.moe_log_expert_assignment:
+            expert_assignments = torch.zeros(
+                (self.model.config.n_layers, self.model.config.moe_num_experts), device=self.device
+            )
+            # Both the EMA path and the baseline path now accumulate _expert_assignments
+            # via a forward hook during eval. Drain them the same way.
+            # (The baseline _router_count_hook only accumulates when model.training is False,
+            # fixing the gap where megablocks skips save_load_balancing_loss during eval.)
+            clear_load_balancing_loss()  # discard any stale megablocks state
+            for layer_idx, block in enumerate(self.model.transformer.blocks):
+                inner = block.module if isinstance(block, FSDP) else block
+                if inner._expert_assignments is not None:
+                    expert_assignments[layer_idx] += inner._expert_assignments
+                    inner._expert_assignments = None
+            eval_metrics.update(self._routing_metrics(expert_assignments, "eval"))
 
         return eval_metrics
 

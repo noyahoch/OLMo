@@ -706,6 +706,12 @@ class OLMoEBlock(OLMoBlock):
             self._ema_sq: Optional[torch.Tensor] = None    # E[X²]  (std = sqrt(E[X²] - E[X]²))
             self._ema_update_norm: float = 0.0
             self.ffn.router.register_forward_hook(self._router_ema_hook)
+        elif config.moe_log_expert_assignment:
+            # Baseline (megablocks) path: megablocks only saves load-balancing data when training,
+            # so eval routing metrics would always be empty. Register a lightweight counting hook
+            # that accumulates expert assignments during eval only.
+            self._expert_assignments: Optional[torch.Tensor] = None
+            self.ffn.router.register_forward_hook(self._router_count_hook)
 
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)
@@ -757,6 +763,30 @@ class OLMoEBlock(OLMoBlock):
             self._ema_mean = None
             self._ema_sq = None
             self._expert_assignments = None
+        elif self.config.moe_log_expert_assignment:
+            self._expert_assignments = None
+
+    def _router_count_hook(
+        self,
+        module: torch.nn.Module,
+        input: Any,
+        output: Any,
+    ) -> None:
+        """Forward hook for the baseline (megablocks) path.
+        Counts tokens routed to each expert during eval only — megablocks does not
+        call save_load_balancing_loss when model.training is False, so without this
+        hook eval routing metrics (maxvio, entropy) would always be empty.
+        Does not modify output or accumulate during training (megablocks handles that).
+        """
+        if self.training:
+            return
+        _, _, _, norm_indices = output
+        num_experts = self.config.moe_num_experts
+        counts = torch.bincount(norm_indices.reshape(-1), minlength=num_experts).float()
+        if self._expert_assignments is None:
+            self._expert_assignments = counts
+        else:
+            self._expert_assignments += counts
 
     def _router_ema_hook(
         self,
@@ -808,12 +838,12 @@ class OLMoEBlock(OLMoBlock):
             self._ema_sq.mul_(alpha).add_((1 - alpha) * logits_fp32.pow(2).mean(dim=0))
             self._ema_update_norm = (self._ema_mean - old_mean).abs().sum().item()
 
-            # Count tokens routed to each expert for load-balance logging.
-            counts = torch.bincount(norm_indices.reshape(-1), minlength=num_experts).float()
-            if self._expert_assignments is None:
-                self._expert_assignments = counts
-            else:
-                self._expert_assignments += counts
+        # Count tokens routed to each expert — train and eval.
+        counts = torch.bincount(norm_indices.reshape(-1), minlength=num_experts).float()
+        if self._expert_assignments is None:
+            self._expert_assignments = counts
+        else:
+            self._expert_assignments += counts
 
         # Cast back to original dtype so megablocks sparse kernels see the expected precision.
         return norm_scores.to(orig_dtype), logits, norm_weights.to(orig_dtype), norm_indices
