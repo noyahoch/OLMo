@@ -70,15 +70,6 @@ from .torch_util import (
 )
 from .util import upload
 
-try:
-    from megablocks.layers.moe import (
-        batched_load_balancing_loss,
-        clear_load_balancing_loss,
-        get_load_balancing_loss,
-    )
-except ImportError:
-    pass
-
 __all__ = ["SpeedMonitor", "LRMonitor", "Trainer"]
 
 log = logging.getLogger(__name__)
@@ -753,21 +744,27 @@ class Trainer:
             doc_lens=batch.get("doc_lens"),
             max_doc_lens=batch.get("max_doc_lens"),
         ).logits
-        logits_for_loss = logits[..., :-1, :].contiguous()
-        # shape: (batch_size * seq_len, vocab_size)
-        logits_for_loss = logits_for_loss.view(-1, logits_for_loss.size(-1))
         # shape: (batch_size, seq_len)
         labels = self.get_labels(batch)
-        # shape: (batch_size * seq_len,)
-        labels = labels.view(-1)
-        ce_loss, z_loss = self.loss_fn(
-            logits_for_loss, labels, ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss
-        )
+        # Compute loss per batch element to avoid materialising a contiguous
+        # [bs, seq-1, vocab] copy alongside the original [bs, seq, vocab] logits.
+        # logits[i, :-1, :] is already contiguous (first-dim index → 2D contiguous slice),
+        # so no extra allocation is needed per element.
+        ce_parts: list = []
+        z_parts: list = []
+        for i in range(logits.size(0)):
+            ce_i, z_i = self.loss_fn(
+                logits[i, :-1, :], labels[i],
+                ignore_index=-100, reduction=loss_reduction, compute_z_loss=compute_z_loss,
+            )
+            ce_parts.append(ce_i)
+            z_parts.append(z_i)
         if loss_reduction == "none":
-            # Reshape (batch_size * seq_len,) -> (batch_size, seq_len)
-            ce_loss = ce_loss.view(batch["input_ids"].shape[0], -1)
-            if z_loss is not None:
-                z_loss = z_loss.view(batch["input_ids"].shape[0], -1)
+            ce_loss = torch.stack(ce_parts)       # (batch_size, seq_len-1)
+            z_loss = torch.stack(z_parts) if z_parts[0] is not None else None
+        else:
+            ce_loss = torch.stack(ce_parts).sum() if loss_reduction == "sum" else torch.stack(ce_parts).mean()
+            z_loss = (torch.stack(z_parts).sum() if loss_reduction == "sum" else torch.stack(z_parts).mean()) if z_parts[0] is not None else None
         return ce_loss, z_loss, logits
 
     def train_micro_batch(
@@ -793,13 +790,24 @@ class Trainer:
 
         return loss, ce_loss, z_loss
 
+    def _iter_moe_blocks(self) -> Iterable[Any]:
+        """Yield the FSDP-unwrapped MoE blocks in layer order. Handles both
+        ``transformer.blocks`` (default) and ``transformer.block_groups`` layouts."""
+        if hasattr(self.model.transformer, "blocks"):
+            raw_blocks: Iterable[Any] = self.model.transformer.blocks
+        else:
+            raw_blocks = (
+                block for group in self.model.transformer.block_groups for block in group
+            )
+        for block in raw_blocks:
+            yield block.module if isinstance(block, FSDP) else block
+
     def train_batch(
         self, batch: Dict[str, Any]
     ) -> Tuple[
         torch.Tensor,
         Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
+        Dict[str, torch.Tensor],
         Optional[Iterable[Any]],
     ]:
         # Split into micro-batches.
@@ -811,17 +819,9 @@ class Trainer:
 
         ce_batch_loss = torch.tensor(0.0, device=self.device)
         z_batch_loss = None if not self.cfg.softmax_auxiliary_loss else torch.tensor(0.0, device=self.device)
-        lb_batch_loss = (
-            None
-            if (
-                self.model.config.block_type != BlockType.moe
-                or not self.model.config.moe_loss_weight
-            )
-            else torch.tensor(0.0, device=self.device)
-        )
-        moe_z_batch_loss = (
-            None if not self.model.config.moe_zloss_weight else torch.tensor(0.0, device=self.device)
-        )
+        # Router-aux loss buckets keyed by metric name (e.g. "LoadBalancingLoss", "MoEZLoss").
+        # Populated lazily from whatever the active RouterStrategy produces — no hardcoded keys.
+        moe_aux_batch_losses: Dict[str, torch.Tensor] = {}
         expert_assignments = (
             None
             if (
@@ -861,55 +861,44 @@ class Trainer:
                         z_batch_loss += z_loss.detach()
 
                 if self.model.config.block_type == BlockType.moe:
-                    # Megablocks path: aux loss and/or z-loss via save_load_balancing_loss.
-                    # Skipped when moe_router_ema_normalize=True because moe_loss_weight=0
-                    # means save_load_balancing_loss is never called (no data to collect).
-                    if self.model.config.moe_zloss_weight and not self.model.config.moe_router_ema_normalize:
-                        lb_loss, moe_z_loss = batched_load_balancing_loss(self.moe_args)
-                        lb_loss = lb_loss / len(micro_batches)
-                        moe_z_loss = moe_z_loss / len(micro_batches)
-                    elif self.model.config.moe_loss_weight:
-                        lb_loss = batched_load_balancing_loss(self.moe_args) / len(micro_batches)
-                    if self.model.config.moe_log_expert_assignment and not self.model.config.moe_router_ema_normalize:
-                        if self.model.config.moe_zloss_weight:
-                            tokens_per_expert, _, _ = zip(*get_load_balancing_loss())
+                    # FSDP-unwrapped blocks in layer order. Every block shares
+                    # the same RouterStrategy subclass — it's just per-block state.
+                    inner_blocks = list(self._iter_moe_blocks())
+                    router_strategy = inner_blocks[0].router_strategy
+                    # Batch-global state (e.g. megablocks' module-level lb queue).
+                    batch_result = router_strategy.collect_batch_global(
+                        moe_args=self.moe_args,
+                        num_layers=self.model.config.n_layers,
+                        num_experts=self.model.config.moe_num_experts,
+                        device=self.device,
+                        log_expert_assignments=self.model.config.moe_log_expert_assignment,
+                        training=True,
+                    )
+                    # Per-block aux losses: drain each block and sum by key.
+                    all_losses: Dict[str, torch.Tensor] = dict(batch_result.losses)
+                    for block in inner_blocks:
+                        aux = block.router_strategy.pop_aux_loss()
+                        if aux is None:
+                            continue
+                        for key, value in aux.items():
+                            all_losses[key] = all_losses[key] + value if key in all_losses else value
+                    for key, value in all_losses.items():
+                        scaled = value / len(micro_batches)
+                        loss = loss + scaled
+                        metric_name = router_strategy.LOSS_METRIC_NAMES[key]
+                        bucket = moe_aux_batch_losses.get(metric_name)
+                        if bucket is None:
+                            bucket = torch.tensor(0.0, device=self.device)
+                        moe_aux_batch_losses[metric_name] = bucket + scaled.detach()
+                    # Expert assignments: batch-global (Default train path) or per-block.
+                    if expert_assignments is not None:
+                        if batch_result.expert_assignments is not None:
+                            expert_assignments += batch_result.expert_assignments
                         else:
-                            tokens_per_expert, _ = zip(*get_load_balancing_loss())
-                        expert_assignments += torch.stack(tokens_per_expert, dim=0)
-                    clear_load_balancing_loss()
-                    if self.model.config.moe_log_expert_assignment and self.model.config.moe_router_ema_normalize:
-                        for layer_idx, block in enumerate(self.model.transformer.blocks):
-                            # Unwrap FSDP: writing block.attr = None would shadow the original
-                            # OLMoEBlock's attribute on the FSDP wrapper's __dict__, causing all
-                            # subsequent micro-batch reads to return None via __dict__ lookup
-                            # instead of delegating to block.module via __getattr__.
-                            inner_block = block.module if isinstance(block, FSDP) else block
-                            if inner_block._expert_assignments is not None:
-                                expert_assignments[layer_idx] += inner_block._expert_assignments
-                                inner_block._expert_assignments = None
-                    if self.model.config.moe_loss_weight:
-                        loss += lb_loss
-                        lb_batch_loss += lb_loss.detach()
-                    if self.model.config.moe_zloss_weight and not self.model.config.moe_router_ema_normalize:
-                        loss += moe_z_loss
-                        moe_z_batch_loss += moe_z_loss.detach()
-                    # EMA path: z-loss computed directly in the router hook, bypassing the
-                    # megablocks coupling between aux loss and z-loss.
-                    if self.model.config.moe_router_ema_normalize and self.model.config.moe_zloss_weight:
-                        ema_z_losses = []
-                        for block in self.model.transformer.blocks:
-                            # Same FSDP unwrapping needed — see note above for _expert_assignments.
-                            inner_block = block.module if isinstance(block, FSDP) else block
-                            if inner_block._router_z_loss is not None:
-                                ema_z_losses.append(inner_block._router_z_loss)
-                            inner_block._router_z_loss = None  # reset for next micro-batch
-                        if ema_z_losses:
-                            # .mean() across layers matches megablocks normalization by num_layers;
-                            # remaining 1/top_k factor difference can be absorbed into moe_zloss_weight.
-                            ema_z_loss = torch.stack(ema_z_losses).mean() / len(micro_batches)
-                            loss += ema_z_loss
-                            assert moe_z_batch_loss is not None
-                            moe_z_batch_loss += ema_z_loss.detach()
+                            for layer_idx, block in enumerate(inner_blocks):
+                                counts = block.router_strategy.pop_expert_assignments()
+                                if counts is not None:
+                                    expert_assignments[layer_idx] += counts
 
                 # Run backward pass.
                 loss.backward()
@@ -918,7 +907,7 @@ class Trainer:
             for hook in output_hooks:
                 hook.remove()
 
-        return ce_batch_loss, z_batch_loss, lb_batch_loss, moe_z_batch_loss, expert_assignments
+        return ce_batch_loss, z_batch_loss, moe_aux_batch_losses, expert_assignments
 
     def train_step(self, batch: Dict[str, Any], reduce_global_loss: bool = True) -> Dict[str, float]:
         metrics: Dict[str, float] = {}
@@ -939,7 +928,7 @@ class Trainer:
         batch = move_to_device(batch, self.device)
 
         # Run forward-backward pass.
-        ce_batch_loss, z_batch_loss, lb_batch_loss, moe_z_batch_loss, expert_assignments = self.train_batch(batch)
+        ce_batch_loss, z_batch_loss, moe_aux_batch_losses, expert_assignments = self.train_batch(batch)
 
         # Collect loss, potentially reducing over all ranks.
         if reduce_global_loss:
@@ -948,12 +937,9 @@ class Trainer:
             if z_batch_loss is not None:
                 dist.reduce(z_batch_loss, 0)
                 z_batch_loss.div_(get_world_size())
-            if lb_batch_loss is not None:
-                dist.reduce(lb_batch_loss, 0)
-                lb_batch_loss.div_(get_world_size())
-            if moe_z_batch_loss is not None:
-                dist.reduce(moe_z_batch_loss, 0)
-                moe_z_batch_loss.div_(get_world_size())
+            for bucket in moe_aux_batch_losses.values():
+                dist.reduce(bucket, 0)
+                bucket.div_(get_world_size())
 
         # Clip gradient norms and collect param/gradient/optim metrics.
         should_log_optim_metrics_this_step = self.should_log_optim_metrics_this_step()
@@ -983,6 +969,11 @@ class Trainer:
         # Optimizer step.
         self.optim.step()
 
+        # Router strategy post-step (e.g. LFB expert-bias update).
+        if self.model.config.block_type == BlockType.moe:
+            for block in self._iter_moe_blocks():
+                block.router_strategy.post_step()
+
         # Collect metrics and check for NaN loss.
         # NOTE: this involves a bunch of host-device syncs so we wait until the last moment to do this.
         if torch.isnan(ce_batch_loss):
@@ -997,8 +988,8 @@ class Trainer:
         metrics["train/Perplexity"] = math.exp(self.cur_train_loss)
         if z_batch_loss is not None:
             metrics["train/ZLoss"] = z_batch_loss.item()
-        if lb_batch_loss is not None:
-            metrics["train/LoadBalancingLoss"] = lb_batch_loss.item()
+        for metric_name, bucket in moe_aux_batch_losses.items():
+            metrics[f"train/{metric_name}"] = bucket.item()
         if expert_assignments is not None:
             for layer_idx, expert_assignments_layer in enumerate(expert_assignments):
                 total_tokens = expert_assignments_layer.sum().item()
@@ -1012,20 +1003,11 @@ class Trainer:
                         f"train/TokensTotal/layer{layer_idx}/expert{expert_idx}"
                     ] = expert_assignment.item()
             metrics.update(self._routing_metrics(expert_assignments, "train"))
-        if moe_z_batch_loss is not None:
-            metrics["train/MoEZLoss"] = moe_z_batch_loss.item()
 
-        # Log per-expert gate logit EMA statistics per layer (only when EMA normalization is enabled)
-        if self.model.config.block_type == BlockType.moe and self.model.config.moe_router_ema_normalize:
-            for layer_idx, block in enumerate(self.model.transformer.blocks):
-                inner = block.module if isinstance(block, FSDP) else block
-                if inner._ema_mean is None:
-                    continue
-                metrics[f"train/GateLogit/EMA_update_norm/layer{layer_idx}"] = inner._ema_update_norm
-                ema_std = (inner._ema_sq - inner._ema_mean.pow(2)).clamp(min=1e-8).sqrt()
-                for expert_idx in range(inner._ema_mean.shape[0]):
-                    metrics[f"train/GateLogit/EMA_mean/layer{layer_idx}/expert{expert_idx}"] = inner._ema_mean[expert_idx].item()
-                    metrics[f"train/GateLogit/EMA_std/layer{layer_idx}/expert{expert_idx}"] = ema_std[expert_idx].item()
+        # Strategy-specific per-layer metrics (EMA stats, LFB bias, ...).
+        if self.model.config.block_type == BlockType.moe:
+            for layer_idx, block in enumerate(self._iter_moe_blocks()):
+                metrics.update(block.router_strategy.metrics(layer_idx, "train/"))
 
         # Maybe collect post-step optimizer-specific metrics.
         if should_log_optim_metrics_this_step:
@@ -1207,16 +1189,26 @@ class Trainer:
             expert_assignments = torch.zeros(
                 (self.model.config.n_layers, self.model.config.moe_num_experts), device=self.device
             )
-            # Both the EMA path and the baseline path now accumulate _expert_assignments
-            # via a forward hook during eval. Drain them the same way.
-            # (The baseline _router_count_hook only accumulates when model.training is False,
-            # fixing the gap where megablocks skips save_load_balancing_loss during eval.)
-            clear_load_balancing_loss()  # discard any stale megablocks state
-            for layer_idx, block in enumerate(self.model.transformer.blocks):
-                inner = block.module if isinstance(block, FSDP) else block
-                if inner._expert_assignments is not None:
-                    expert_assignments[layer_idx] += inner._expert_assignments
-                    inner._expert_assignments = None
+            # Every router strategy accumulates expert assignments via its forward
+            # hook during eval; drain them uniformly. The megablocks lb queue is
+            # already cleared at the end of each training batch by Default's
+            # collect_batch_global, so no defensive clear needed here.
+            inner_blocks = list(self._iter_moe_blocks())
+            eval_result = inner_blocks[0].router_strategy.collect_batch_global(
+                moe_args=self.moe_args,
+                num_layers=self.model.config.n_layers,
+                num_experts=self.model.config.moe_num_experts,
+                device=self.device,
+                log_expert_assignments=self.model.config.moe_log_expert_assignment,
+                training=False,
+            )
+            if eval_result.expert_assignments is not None:
+                expert_assignments = eval_result.expert_assignments
+            else:
+                for layer_idx, block in enumerate(inner_blocks):
+                    counts = block.router_strategy.pop_expert_assignments()
+                    if counts is not None:
+                        expert_assignments[layer_idx] += counts
             eval_metrics.update(self._routing_metrics(expert_assignments, "eval"))
 
         return eval_metrics

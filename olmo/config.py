@@ -205,6 +205,43 @@ class BlockType(StrEnum):
     """
 
 
+class RouterType(StrEnum):
+    default = "default"
+    """Unmodified megablocks routing. Uses megablocks' own load-balancing
+    and optional z-loss."""
+
+    ema = "ema"
+    """Per-expert EMA z-score normalization of router logits before top-k.
+    Replaces load-balancing loss; optional router z-loss."""
+
+    loss_free_balancing = "loss_free_balancing"
+    """DeepSeek-V3 style: per-expert bias added to logits for top-k selection
+    (mixing weights stay unbiased). Bias updated each step from observed
+    imbalance; optional complementary sequence-level aux loss."""
+
+
+@dataclass
+class RouterConfig(BaseConfig):
+    """Selects and parametrizes a routing strategy for MoE blocks."""
+
+    type: RouterType = RouterType.default
+
+    # EMA strategy
+    ema_alpha: float = 0.99
+    """EMA decay for per-expert logit mean/std statistics."""
+
+    ema_zloss_weight: float = 0.0
+    """Weight of the router z-loss computed on unnormalized logits. 0 disables."""
+
+    # Loss-free balancing strategy
+    lfb_bias_update_rate: float = 1e-3
+    """Step size for the per-expert bias update: ``b += rate * sign(mean - count)``."""
+
+    lfb_seq_aux_weight: float = 0.0
+    """Weight of the optional sequence-level load-balance auxiliary loss.
+    0 disables (pure loss-free balancing)."""
+
+
 class InitFnType(StrEnum):
     mitchell = "mitchell"
     """
@@ -503,10 +540,23 @@ class ModelConfig(BaseConfig):
     Weight for MoE router z-loss where None means no router z-loss. 0.001 is a common value.
     """
 
-    moe_router_ema_normalize: bool = False
+    moe_normalize_expert_weights: Optional[float] = None
     """
-    If True, normalize router logits by a per-expert EMA of mean/std before top-k selection,
-    replacing the need for a load-balancing auxiliary loss (set moe_loss_weight=0 when enabled).
+    If set, L^p-normalize per-token top-k expert weights after the router. Matches
+    the megablocks ``moe_normalize_expert_weights`` flag. ``None`` (default) disables.
+    Common values: ``1`` (L1, weights sum to 1) or ``2`` (L2).
+    """
+
+    moe_router: RouterConfig = field(default_factory=RouterConfig)
+    """
+    Router strategy configuration. See :class:`RouterConfig` / :class:`RouterType`.
+    Replaces the old ``moe_router_ema_normalize`` flag.
+    """
+
+    moe_router_ema_normalize: Optional[bool] = None
+    """
+    Deprecated. Use ``moe_router.type = "ema"`` instead. Kept only so that loading
+    an old YAML raises a clear error in ``__post_init__``.
     """
 
     moe_dropless: Optional[bool] = True
@@ -534,6 +584,14 @@ class ModelConfig(BaseConfig):
     """
     Apply norm after the attention/feedforward layers rather than before, as introduced in the Swin transformer paper (Liu et al).
     """
+
+    def __post_init__(self):
+        if self.moe_router_ema_normalize is not None:
+            raise OLMoConfigurationError(
+                "`moe_router_ema_normalize` is deprecated. Replace with "
+                "`moe_router: {type: ema, ema_zloss_weight: <prev moe_zloss_weight>}` "
+                "(and set `moe_zloss_weight: null` — the EMA strategy owns its own z-loss weight)."
+            )
 
     @property
     def effective_n_kv_heads(self) -> int:
@@ -1381,5 +1439,7 @@ def config_to_moe_args(config: ModelConfig) -> Dict[str, Any]:
     }
     if config.moe_zloss_weight:
         kwargs["moe_zloss_weight"] = config.moe_zloss_weight
+    if config.moe_normalize_expert_weights is not None:
+        kwargs["moe_normalize_expert_weights"] = config.moe_normalize_expert_weights
 
     return MoEArgs(**kwargs)
