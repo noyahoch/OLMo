@@ -57,3 +57,6 @@ site/
 /scratch/
 core
 slurm_output
+*/runs/*
+*logs/*
+

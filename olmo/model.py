@@ -698,6 +698,11 @@ class OLMoEBlock(OLMoBlock):
         self.router_strategy = build_router_strategy(config)
         self.ffn.router.register_forward_pre_hook(self.router_strategy.router_pre_hook)
         self.ffn.router.register_forward_hook(self.router_strategy.router_forward_hook)
+        # For strategies that measure drop rate from the experts dispatch step
+        # (e.g. SkyworkRouterStrategy), register a hook on ffn.experts (ParallelMLP).
+        # Only meaningful when capacity is enforced (moe_dropless=False).
+        if hasattr(self.router_strategy, "experts_forward_hook") and not config.moe_dropless:
+            self.ffn.experts.register_forward_hook(self.router_strategy.experts_forward_hook)
 
         self.attn_norm = LayerNorm.build(config)
         self.ff_norm = LayerNorm.build(config)

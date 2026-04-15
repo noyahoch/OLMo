@@ -219,6 +219,12 @@ class RouterType(StrEnum):
     (mixing weights stay unbiased). Bias updated each step from observed
     imbalance; optional complementary sequence-level aux loss."""
 
+    skywork = "skywork"
+    """Skywork-MoE: per-token z-score gating logit normalization (sharpness λ) plus
+    adaptive per-layer auxiliary loss coefficient driven by token drop rate.
+    Requires moe_dropless=False. Conditionally paper-faithful subject to capacity
+    formula verification against the MegaBlocks runtime: arXiv 2406.06563."""
+
 
 @dataclass
 class RouterConfig(BaseConfig):
@@ -240,6 +246,27 @@ class RouterConfig(BaseConfig):
     lfb_seq_aux_weight: float = 0.0
     """Weight of the optional sequence-level load-balance auxiliary loss.
     0 disables (pure loss-free balancing)."""
+
+    # Skywork strategy
+    skywork_sharpness: float = 1.0
+    """λ: scales normalized logits before softmax. Higher values produce a sharper
+    routing distribution. Diagnostic: increasing λ leads to lower routing entropy
+    and higher Max1/Max2 and Max2/Max3 ratios, indicating stronger expert
+    discrimination (see Figure 3 in arXiv 2406.06563). Paper tests λ ∈ {1, 2, 4}."""
+
+    skywork_xi: float = 0.2
+    """ξ: maps drop rate d to target α̂: α̂ = ξ * d (capped at skywork_alpha_max).
+    Paper value: ξ = 1/5."""
+
+    skywork_alpha_max: float = 0.01
+    """Hard cap on per-layer adaptive aux loss coefficient. Paper value: 0.01."""
+
+    skywork_beta: float = 0.99
+    """EMA smoothing for α update: α = β * α_prev + (1 - β) * α̂. Paper value: 0.99."""
+
+    skywork_init_alpha: float = 0.0
+    """Initial α per layer. Implementation choice (paper is silent on init); 0.0 means
+    no aux loss until drop rate accumulates."""
 
 
 class InitFnType(StrEnum):

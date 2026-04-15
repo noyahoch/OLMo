@@ -1,0 +1,165 @@
+run_name: olmoe17-8x1b-default-strategy-2g
+seed: 6198
+dry_run: false
+no_pre_train_checkpoint: true
+
+wandb:
+  name: ${run_name}
+  project: OLMoE Experiments
+  entity: MoEPaper
+  group: null
+  log_interval: 100
+
+model:
+  moe_shared_expert: true
+  d_model: 2048
+  n_heads: 16
+  n_layers: 8
+  mlp_ratio: 2
+  weight_tying: false
+  alibi: false
+  rope: true
+  flash_attention: true
+  attention_dropout: 0.0
+  attention_layer_norm: true
+  include_bias: false
+  block_type: moe
+  layer_norm_type: rms
+  layer_norm_with_affine: true
+  bias_for_layer_norm: false
+  attention_layer_norm_with_affine: false
+  activation_type: swiglu
+  residual_dropout: 0.0
+  embedding_dropout: 0.0
+  max_sequence_length: 4096
+  vocab_size: 50280
+  embedding_size: 50304
+  eos_token_id: 0
+  pad_token_id: 1
+  init_device: meta
+  init_fn: normal
+  init_cutoff_factor: 3
+  moe_top_k: 2
+  moe_num_experts: 8
+  moe_dropless: true
+  moe_mlp_impl: sparse
+  moe_zloss_weight: 0.001
+  moe_loss_weight: 0.01
+  moe_router:
+    type: default
+
+compile: null
+
+optimizer:
+  name: adamw
+  learning_rate: 4.0e-4
+  weight_decay: 0.1
+  decay_norm_and_bias: true
+  decay_embeddings: false
+  betas:
+  - 0.9
+  - 0.95
+  metrics_log_interval: 100
+
+
+scheduler:
+  name: cosine_with_warmup
+  units: tokens
+  t_warmup: 1000000000
+  t_max: 3e12
+  alpha_f: 0.1
+
+tokenizer:
+  identifier: tokenizers/allenai_gpt-neox-olmo-dolma-v1_5.json
+  truncate_direction: right
+
+save_folder: /home/morg/students/noyahochwald/OLMo/runs/${run_name}
+save_overwrite: true
+
+save_interval: 1000
+save_interval_ephemeral: null
+save_num_checkpoints_to_keep: 2
+sharded_checkpointer: olmo_core
+
+load_path: null
+
+max_duration: 2ep
+global_train_batch_size: 32
+device_train_microbatch_size: 8
+
+
+precision: amp_bf16
+activation_checkpointing: fine_grained
+distributed_strategy: fsdp
+
+fsdp:
+  wrapping_strategy: by_block
+  precision: mixed
+  sharding_strategy: FULL_SHARD
+
+max_grad_norm: 1.0
+max_grad_norm_ratio: null
+
+console_log_interval: 100
+
+speed_monitor:
+  window_size: 1
+
+eval_interval: 1000
+eval_subset_num_batches: 10
+device_eval_batch_size: 4
+
+evaluators:
+  - label: wiki-validation
+    data:
+      num_workers: 4
+      drop_last: true
+      paths:
+        - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/wiki/part-0-00001.npy
+
+  - label: hellaswag
+    type: downstream
+
+data:
+  num_workers: 4
+  drop_last: true
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  timeout: 0
+  instance_filter:
+      repetition_max_period: 13
+      repetition_min_period: 1
+      repetition_max_count: 32
+  paths:
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/algebraic-stack/part-0-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-00-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-01-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-02-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-03-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-04-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-05-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-06-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-07-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-08-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-09-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-10-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-11-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-12-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-13-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-14-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/dclm/part-15-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/open-web-math/part-0-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/pes2o/part-0-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/pes2o/part-0-00001.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-0-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-1-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-2-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-3-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-4-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-5-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-6-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-7-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/starcoder/part-8-00000.npy
+    - /home/morg/students/sagiahrac/dataset/olmoe-1pct/tokenized/wiki/part-0-00000.npy
+    # wiki/part-0-00001.npy held out for validation

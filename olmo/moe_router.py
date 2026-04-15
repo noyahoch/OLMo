@@ -393,6 +393,206 @@ class LossFreeBalancingRouterStrategy(RouterStrategy):
         return out
 
 
+class SkyworkRouterStrategy(RouterStrategy):
+    """Skywork-MoE: per-token z-score gating logit normalization + adaptive
+    per-layer auxiliary loss coefficient driven by token drop rate.
+
+    Two hooks are used:
+      1. ``router_forward_hook`` on ``ffn.router``: normalizes logits, computes
+         routing and aux loss.
+      2. ``experts_forward_hook`` on ``ffn.experts`` (ParallelMLP): measures
+         token drop rate from the dispatcher and accumulates the signal used to
+         update α.
+
+    Requires ``moe_dropless=False`` for a meaningful drop signal.
+
+    Reference: arXiv 2406.06563 §3.2 and §3.3.
+    """
+
+    # Map loss key to trainer metric suffix.
+    LOSS_METRIC_NAMES: Mapping[str, str] = {
+        **RouterStrategy.LOSS_METRIC_NAMES,
+        "lb_adaptive": "LoadBalancingLoss",
+    }
+
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        sharpness: float,
+        xi: float,
+        alpha_max: float,
+        beta: float,
+        init_alpha: float,
+    ):
+        super().__init__(num_experts, top_k)
+        self.sharpness = sharpness
+        self.xi = xi
+        self.alpha_max = alpha_max
+        self.beta = beta
+        self.init_alpha = init_alpha
+        # Persistent fp32 buffer — saved/restored from checkpoints.
+        self.register_buffer(
+            "_alpha", torch.tensor(init_alpha, dtype=torch.float32), persistent=True
+        )
+        # Non-persistent accumulators reset each post_step.
+        self._step_signal: float = 0.0
+        self._step_count: int = 0
+        self._last_signal: float = 0.0
+        self._staged_lb: Optional[torch.Tensor] = None
+        # Cached norm_scores from latest forward for use in metrics().
+        self._last_norm_scores: Optional[torch.Tensor] = None
+
+    def reset_parameters(self) -> None:
+        super().reset_parameters()
+        self._alpha.fill_(self.init_alpha)
+        self._step_signal = 0.0
+        self._step_count = 0
+        self._last_signal = 0.0
+        self._staged_lb = None
+        self._last_norm_scores = None
+
+    def router_forward_hook(self, module, inputs, output):
+        _, logits, _, _ = output
+        orig_dtype = logits.dtype
+
+        # Per-token z-score normalization across the expert dimension (paper Eq. 6).
+        # Different from EMARouterStrategy which tracks running per-expert stats;
+        # Skywork normalizes each token's logit vector by its own mean/std at forward time.
+        mu = logits.mean(dim=-1, keepdim=True)
+        var = logits.var(dim=-1, unbiased=False, keepdim=True)
+        sigma = torch.sqrt(var + 1e-6)
+        z_hat = self.sharpness * (logits - mu) / sigma
+        norm_scores = z_hat.softmax(dim=-1)
+        norm_weights, norm_indices = module._top_k(norm_scores)
+
+        if module.args.moe_normalize_expert_weights:
+            norm_weights = norm_weights / torch.norm(
+                norm_weights, p=module.args.moe_normalize_expert_weights, dim=-1, keepdim=True
+            )
+
+        self._last_norm_scores = norm_scores.detach()
+        self._accumulate_assignments(norm_indices)
+
+        # Adaptive auxiliary loss (paper Eq. 4).
+        # BLOCKING CHECK: verify the exact Eq. (4) scaling from the paper PDF before
+        # merging. The paper's adaptive α values are calibrated to a specific loss scale.
+        # If there is an extra factor of num_experts or batch size, α dynamics will differ.
+        if self.training:
+            mean_scores = norm_scores.mean(dim=0)  # [num_experts]
+            l_aux = ((1.0 / self.num_experts - mean_scores) ** 2).sum()
+            # α is detached (Python float); l_aux participates in the gradient graph.
+            # Accumulate across microbatches so no contribution is lost before pop_aux_loss().
+            loss = float(self._alpha.item()) * l_aux
+            self._staged_lb = loss if self._staged_lb is None else self._staged_lb + loss
+
+        return norm_scores.to(orig_dtype), logits, norm_weights.to(orig_dtype), norm_indices
+
+    def experts_forward_hook(
+        self,
+        module,   # ParallelMLP instance (self.ffn.experts)
+        inputs,   # (x, scores, logits, expert_weights, top_experts)
+        output,   # transformed x — tokens_per_expert is NOT in the output
+    ) -> None:
+        """Measure token drop rate from the ParallelMLP forward pass.
+
+        ``ParallelMLP.forward`` receives ``top_experts`` (the per-token expert
+        assignments) and internally enforces capacity via ``binned_gather``.
+        Assignments beyond capacity are silently dropped.  The drop count is
+        reconstructed here from ``top_experts`` and ``module.expert_capacity()``,
+        which uses the same formula as the dispatcher.
+
+        Blocking checks before trusting this signal:
+        1. Confirm ``top_experts`` in inputs is the pre-capacity assignment tensor
+           (shape [bs*sl, top_k]) — verify in megablocks/layers/moe.py forward_once.
+        2. Confirm ``x.shape[0] * x.shape[1]`` equals the number of input tokens
+           that ``module.expert_capacity()`` expects.
+        """
+        if not self.training:
+            return
+
+        # Positional unpacking to avoid coupling to the exact ParallelMLP.forward signature;
+        # only the first and last inputs are load-bearing here.
+        x = inputs[0]
+        top_experts = inputs[-1]
+        # x: [bs, sl, hs] — 3D, so num_input_tokens = bs * sl
+        num_input_tokens = x.shape[0] * x.shape[1]
+
+        # Compute per-expert assignment histogram (same as ops.histogram inside forward_once).
+        tokens_per_expert = torch.bincount(
+            top_experts.reshape(-1).long(), minlength=self.num_experts
+        ).float()
+        # total_assignments == num_input_tokens * top_k when top_experts is the
+        # pre-capacity assignment tensor. Validate this during the cross-check run.
+        total_assignments = int(tokens_per_expert.sum().item())
+        assert total_assignments == num_input_tokens * self.top_k, (
+            f"Skywork drop-rate reconstruction sanity check failed: "
+            f"total_assignments={total_assignments} != "
+            f"num_input_tokens*top_k={num_input_tokens * self.top_k}. "
+            f"top_experts may not be pre-capacity or num_input_tokens is wrong."
+        )
+
+        # expert_capacity uses module.args so the formula always matches the dispatcher.
+        expert_capacity = module.expert_capacity(num_input_tokens)
+
+        # Dispatcher-faithful reconstruction: binned_gather keeps first
+        # min(count_i, expert_capacity) tokens per expert, dropping the rest.
+        dropped = (tokens_per_expert - expert_capacity).clamp(min=0).sum().item()
+        drop_rate = dropped / max(1, total_assignments)
+
+        self._step_signal += drop_rate
+        self._step_count += 1
+
+    def pop_aux_loss(self) -> Optional[Dict[str, torch.Tensor]]:
+        if self._staged_lb is None:
+            return None
+        out = {"lb_adaptive": self._staged_lb}
+        self._staged_lb = None
+        return out
+
+    def post_step(self) -> None:
+        """Update per-layer α from accumulated drop rate signal via EMA.
+
+        Per-rank implementation choice: α is updated from local routing stats
+        without all_reduce. Safe for single-device runs. For distributed training
+        with expert parallelism, add an all_reduce of _step_signal before this
+        update if cross-rank consistency is needed (add a skywork_sync_signal flag).
+        """
+        d = self._step_signal / max(1, self._step_count)
+        self._last_signal = d
+        alpha_hat = min(self.xi * d, self.alpha_max)
+        new_alpha = self.beta * self._alpha.item() + (1.0 - self.beta) * alpha_hat
+        self._alpha.fill_(new_alpha)
+        self._step_signal = 0.0
+        self._step_count = 0
+
+    def metrics(self, layer_idx: int, prefix: str) -> Dict[str, float]:
+        out: Dict[str, float] = {
+            f"{prefix}Skywork/alpha/layer{layer_idx}": self._alpha.item(),
+            f"{prefix}Skywork/drop_rate/layer{layer_idx}": self._last_signal,
+        }
+        if self._last_norm_scores is not None:
+            with torch.no_grad():
+                p = self._last_norm_scores.float().clamp(min=1e-9)
+                # Routing entropy: lower = sharper. Key λ diagnostic.
+                entropy = -(p * p.log()).sum(dim=-1).mean().item()
+                sorted_p, _ = p.sort(dim=-1, descending=True)
+                max1_max2 = (sorted_p[:, 0] / sorted_p[:, 1].clamp(min=1e-9)).mean().item()
+                # Max2/Max3 requires at least 3 experts (guard against IndexError).
+                if self.num_experts >= 3:
+                    max2_max3: float = (
+                        sorted_p[:, 1] / sorted_p[:, 2].clamp(min=1e-9)
+                    ).mean().item()
+                else:
+                    max2_max3 = float("nan")
+            out.update({
+                f"{prefix}Skywork/routing_entropy/layer{layer_idx}": entropy,
+                f"{prefix}Skywork/max1_max2/layer{layer_idx}": max1_max2,
+                f"{prefix}Skywork/max2_max3/layer{layer_idx}": max2_max3,
+            })
+        return out
+
+
 def build_router_strategy(config) -> RouterStrategy:
     """Factory. Reads ``config.moe_router`` and returns the matching strategy.
 
@@ -420,5 +620,15 @@ def build_router_strategy(config) -> RouterStrategy:
             top_k=top_k,
             bias_update_rate=router_cfg.lfb_bias_update_rate,
             seq_aux_weight=router_cfg.lfb_seq_aux_weight,
+        )
+    if router_cfg.type == RouterType.skywork:
+        return SkyworkRouterStrategy(
+            num_experts=num_experts,
+            top_k=top_k,
+            sharpness=router_cfg.skywork_sharpness,
+            xi=router_cfg.skywork_xi,
+            alpha_max=router_cfg.skywork_alpha_max,
+            beta=router_cfg.skywork_beta,
+            init_alpha=router_cfg.skywork_init_alpha,
         )
     raise ValueError(f"Unknown router type: {router_cfg.type}")
