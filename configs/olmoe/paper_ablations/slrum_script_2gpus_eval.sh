@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=lfb-bs4
+#SBATCH --job-name=eval-ema-bs4
 #SBATCH --partition=gpu-morgeva
 #SBATCH --account=gpu-research
 #SBATCH --nodes=1
@@ -7,8 +7,7 @@
 #SBATCH --gpus=2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-
-#SBATCH --time=36:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
@@ -22,4 +21,6 @@ echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 nvidia-smi
 
 PORT=$((8000 + RANDOM % 1000))
-torchrun --nproc_per_node=2  --master_port=$PORT scripts/train.py configs/olmoe/paper_ablations/olmoe17-8x1b-lfb-strategy.yaml
+torchrun --nproc_per_node=2 --master_port=$PORT scripts/eval_routing.py \
+    configs/olmoe/paper_ablations/olmoe17-8x1b-lfb-strategy.yaml \
+    --device_eval_batch_size=64

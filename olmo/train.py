@@ -1070,14 +1070,16 @@ class Trainer:
         return metrics
 
     def _routing_metrics(self, expert_assignments: torch.Tensor, prefix: str) -> Dict[str, float]:
-        """Compute per-layer and mean MaxVio + entropy from expert token counts.
+        """Compute per-layer and mean routing balance metrics from expert token counts.
 
         expert_assignments: [n_layers, num_experts] accumulated token counts.
         MaxVio = (max_load - fair_share) / fair_share  (0 = perfect balance).
         Entropy normalized to [0, 1] by log(num_experts).
+        CV = std(counts) / mean(counts)  (0 = perfect balance).
+        Max/Min ratio = max(counts) / min(counts)  (1 = perfect balance).
         """
         metrics: Dict[str, float] = {}
-        maxvio_layers, entropy_norm_layers = [], []
+        maxvio_layers, entropy_norm_layers, cv_layers, maxmin_layers = [], [], [], []
         for layer_idx, layer_counts in enumerate(expert_assignments):
             total_tokens = layer_counts.sum().item()
             if total_tokens == 0:
@@ -1088,13 +1090,21 @@ class Trainer:
             maxvio = ((counts.max() - fair_share) / fair_share).item()
             p = counts / total_tokens
             entropy_norm = -(p * torch.log(p + 1e-10)).sum().item() / math.log(num_experts)
+            cv = (counts.std() / counts.mean()).item()
+            maxmin = (counts.max() / counts.min().clamp(min=1)).item()
             metrics[f"{prefix}/routing/maxvio/layer{layer_idx}"] = maxvio
             metrics[f"{prefix}/routing/entropy_normalized/layer{layer_idx}"] = entropy_norm
+            metrics[f"{prefix}/routing/cv/layer{layer_idx}"] = cv
+            metrics[f"{prefix}/routing/maxmin_ratio/layer{layer_idx}"] = maxmin
             maxvio_layers.append(maxvio)
             entropy_norm_layers.append(entropy_norm)
+            cv_layers.append(cv)
+            maxmin_layers.append(maxmin)
         if maxvio_layers:
             metrics[f"{prefix}/routing/maxvio"] = sum(maxvio_layers) / len(maxvio_layers)
             metrics[f"{prefix}/routing/entropy_normalized"] = sum(entropy_norm_layers) / len(entropy_norm_layers)
+            metrics[f"{prefix}/routing/cv"] = sum(cv_layers) / len(cv_layers)
+            metrics[f"{prefix}/routing/maxmin_ratio"] = sum(maxmin_layers) / len(maxmin_layers)
         return metrics
 
     def log_metrics_to_console(self, prefix: str, metrics: Dict[str, float]):
@@ -1209,6 +1219,21 @@ class Trainer:
                     counts = block.router_strategy.pop_expert_assignments()
                     if counts is not None:
                         expert_assignments[layer_idx] += counts
+            # Each rank only sees its own DistributedSampler slice; sum so
+            # routing metrics reflect routing over the full validation data.
+            if dist.is_available() and dist.is_initialized() and get_world_size() > 1:
+                dist.all_reduce(expert_assignments, op=dist.ReduceOp.SUM)
+            for layer_idx, layer_counts in enumerate(expert_assignments):
+                total_tokens = layer_counts.sum().item()
+                if total_tokens == 0:
+                    continue
+                for expert_idx, expert_count in enumerate(layer_counts):
+                    eval_metrics[f"eval/TokensPercentage/layer{layer_idx}/expert{expert_idx}"] = (
+                        expert_count.item() / total_tokens
+                    ) * 100
+                    eval_metrics[
+                        f"eval/TokensTotal/layer{layer_idx}/expert{expert_idx}"
+                    ] = expert_count.item()
             eval_metrics.update(self._routing_metrics(expert_assignments, "eval"))
 
         return eval_metrics

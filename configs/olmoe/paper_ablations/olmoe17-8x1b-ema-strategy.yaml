@@ -1,4 +1,4 @@
-run_name: olmoe17-8x1b-ema-strategy-2g
+run_name: ema-bs4-optagg
 seed: 6198
 dry_run: false
 no_pre_train_checkpoint: true
@@ -7,7 +7,7 @@ wandb:
   name: ${run_name}
   project: OLMoE Experiments
   entity: MoEPaper
-  group: null
+  group: 200K_warmup
   log_interval: 100
 
 model:
@@ -67,8 +67,8 @@ optimizer:
 scheduler:
   name: cosine_with_warmup
   units: tokens
-  t_warmup: 1000000000
-  t_max: 3e12
+  t_warmup: 25000000
+  t_max: 2500000000
   alpha_f: 0.1
 
 tokenizer:
@@ -85,8 +85,8 @@ sharded_checkpointer: olmo_core
 
 load_path: null
 
-max_duration: 2ep
-global_train_batch_size: 32
+max_duration: 8000
+global_train_batch_size: 128
 device_train_microbatch_size: 8
 
 precision: amp_bf16
@@ -109,6 +109,7 @@ speed_monitor:
 eval_interval: 1000
 eval_subset_num_batches: 10
 device_eval_batch_size: 4
+
 
 evaluators:
   - label: wiki-validation

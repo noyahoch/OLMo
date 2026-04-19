@@ -97,7 +97,7 @@ class RouterStrategy(nn.Module):
 
     def post_step(self) -> None:
         """Called once per optimizer step, after ``optim.step()``. LFB uses this
-        to update its expert bias; Default and EMA are no-ops."""
+        to update its expert bias; EMA uses it to apply accumulated stats; Default is a no-op."""
         return
 
     def metrics(self, layer_idx: int, prefix: str) -> Dict[str, float]:
@@ -133,8 +133,6 @@ class DefaultRouterStrategy(RouterStrategy):
     """
 
     def router_forward_hook(self, module, inputs, output):
-        if self.training:
-            return None
         _, _, _, indices = output
         self._accumulate_assignments(indices)
         return None
@@ -163,19 +161,17 @@ class DefaultRouterStrategy(RouterStrategy):
             # accumulates per-block counts and train.py drains them.
             return BatchGlobalRouterResult(losses=losses, expert_assignments=assignments)
 
-        # Both returned losses are already weighted inside megablocks
-        # (lb by ``moe_loss_weight``, z by ``moe_zloss_weight``). We gate on
-        # the weights here so zero-valued losses don't pollute logs and we
-        # skip the megablocks call entirely when nothing is wanted.
-        if moe_args.moe_loss_weight:
+        # Megablocks only populates the lb queue when moe_loss_weight > 0
+        # (checked inside its forward). When it is populated we always
+        # compute the losses for logging; they are only added to the
+        # training objective by the trainer when moe_loss_weight > 0.
+        lb_state = get_load_balancing_loss()
+        if lb_state:
             lb_loss, z_loss = batched_load_balancing_loss(moe_args)
             losses["lb"] = lb_loss
             if moe_args.moe_zloss_weight:
                 losses["z"] = z_loss
-
-        if log_expert_assignments:
-            lb_state = get_load_balancing_loss()
-            if lb_state:
+            if log_expert_assignments:
                 tokens_per_expert = [entry[0] for entry in lb_state]
                 assignments = torch.stack(tokens_per_expert, dim=0)
         clear_load_balancing_loss()
@@ -212,6 +208,14 @@ class EMARouterStrategy(RouterStrategy):
         self.register_buffer(
             "_ema_sq", torch.ones(num_experts, dtype=torch.float32), persistent=True
         )
+        # Non-persistent accumulators for per-step EMA updates.
+        self.register_buffer(
+            "_accum_mean", torch.zeros(num_experts, dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_accum_sq", torch.zeros(num_experts, dtype=torch.float32), persistent=False
+        )
+        self._accum_count: int = 0
         self._ema_update_norm: float = 0.0
         self._staged_zloss: Optional[torch.Tensor] = None
 
@@ -219,6 +223,9 @@ class EMARouterStrategy(RouterStrategy):
         super().reset_parameters()
         self._ema_mean.zero_()
         self._ema_sq.fill_(1.0)
+        self._accum_mean.zero_()
+        self._accum_sq.zero_()
+        self._accum_count = 0
         self._ema_update_norm = 0.0
         self._staged_zloss = None
 
@@ -244,16 +251,26 @@ class EMARouterStrategy(RouterStrategy):
 
         if self.training:
             logits_fp32 = raw_logits.float()
-            old_mean = ema_mean.clone()
-            new_mean = ema_mean.mul_(self.alpha).add_((1 - self.alpha) * logits_fp32.mean(dim=0))
-            new_sq = ema_sq.mul_(self.alpha).add_((1 - self.alpha) * logits_fp32.pow(2).mean(dim=0))
-            self._ema_mean.copy_(new_mean)
-            self._ema_sq.copy_(new_sq)
-            self._ema_update_norm = (new_mean - old_mean).abs().sum().item()
+            self._accum_mean.add_(logits_fp32.mean(dim=0))
+            self._accum_sq.add_(logits_fp32.pow(2).mean(dim=0))
+            self._accum_count += 1
 
         self._accumulate_assignments(norm_indices)
 
         return norm_scores.to(orig_dtype), logits, norm_weights.to(orig_dtype), norm_indices
+
+    def post_step(self) -> None:
+        if self._accum_count == 0:
+            return
+        batch_mean = self._accum_mean / self._accum_count
+        batch_sq = self._accum_sq / self._accum_count
+        old_mean = self._ema_mean.clone()
+        self._ema_mean.mul_(self.alpha).add_((1 - self.alpha) * batch_mean)
+        self._ema_sq.mul_(self.alpha).add_((1 - self.alpha) * batch_sq)
+        self._ema_update_norm = (self._ema_mean - old_mean).abs().sum().item()
+        self._accum_mean.zero_()
+        self._accum_sq.zero_()
+        self._accum_count = 0
 
     def pop_aux_loss(self) -> Optional[Dict[str, torch.Tensor]]:
         if self._staged_zloss is None:
